@@ -8,6 +8,7 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	pkgconfig "github.com/skevetter/devpod/pkg/config"
 	"github.com/skevetter/devpod/pkg/devcontainer/config"
@@ -222,6 +223,12 @@ func (r *runner) substitute(
 	}, substitutionContext, nil
 }
 
+const (
+	jsonObjectStart = "{"
+	jsonArrayStart  = "["
+)
+
+// resolveCLIMounts parses CLI-provided mount values and applies variable substitution.
 func resolveCLIMounts(
 	substitutionContext *config.SubstitutionContext,
 	mounts []string,
@@ -232,15 +239,9 @@ func resolveCLIMounts(
 
 	resolvedMounts := make([]*config.Mount, 0, len(mounts))
 	for _, mount := range mounts {
-		parsedMount := &config.Mount{}
-		if err := json.Unmarshal([]byte(mount), parsedMount); err != nil {
-			parsed := config.ParseMount(mount)
-			parsedMount = &parsed
-		}
-
-		resolvedMount := &config.Mount{}
-		if err := config.Substitute(substitutionContext, parsedMount, resolvedMount); err != nil {
-			return nil, fmt.Errorf("substitute --mount values: %w", err)
+		resolvedMount, err := resolveCLIMount(substitutionContext, mount)
+		if err != nil {
+			return nil, err
 		}
 
 		resolvedMounts = append(resolvedMounts, resolvedMount)
@@ -249,6 +250,39 @@ func resolveCLIMounts(
 	return resolvedMounts, nil
 }
 
+func resolveCLIMount(
+	substitutionContext *config.SubstitutionContext,
+	mount string,
+) (*config.Mount, error) {
+	mountInput := strings.TrimSpace(mount)
+	parsedMount := &config.Mount{}
+	if err := json.Unmarshal([]byte(mountInput), parsedMount); err != nil {
+		if strings.HasPrefix(mountInput, jsonObjectStart) ||
+			strings.HasPrefix(mountInput, jsonArrayStart) {
+			return nil, fmt.Errorf("parse --mount JSON: %w", err)
+		}
+		parsed := config.ParseMount(mountInput)
+		parsedMount = &parsed
+	}
+	if strings.TrimSpace(parsedMount.Target) == "" {
+		return nil, fmt.Errorf("invalid --mount %q: target is required", mount)
+	}
+
+	resolvedMount := &config.Mount{}
+	if err := config.Substitute(substitutionContext, parsedMount, resolvedMount); err != nil {
+		return nil, fmt.Errorf("substitute --mount values: %w", err)
+	}
+	if strings.TrimSpace(resolvedMount.Target) == "" {
+		return nil, fmt.Errorf("invalid --mount %q: target is required", mount)
+	}
+
+	return resolvedMount, nil
+}
+
+// mergeCLIMounts merges CLI-provided mounts into the final runtime config.
+//
+// CLI mounts take precedence over existing mounts that resolve to the same target,
+// and when multiple CLI mounts use the same target, the last CLI mount wins.
 func mergeCLIMounts(
 	mergedConfig *config.MergedDevContainerConfig,
 	substitutionContext *config.SubstitutionContext,
@@ -264,8 +298,7 @@ func mergeCLIMounts(
 
 	cliTargets := map[string]bool{}
 	dedupedCLIMounts := make([]*config.Mount, 0, len(resolvedMounts))
-	for i := len(resolvedMounts) - 1; i >= 0; i-- {
-		mount := resolvedMounts[i]
+	for _, mount := range slices.Backward(resolvedMounts) {
 		if cliTargets[mount.Target] {
 			continue
 		}
